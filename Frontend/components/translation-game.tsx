@@ -16,7 +16,7 @@ import { matchAnswer, textToSpeech } from "@/lib/api-client";
 const questions = [
   {
     id: 1,
-    english: "Where is Rwanda Coding Academy located?",
+    english: "Rwanda Coding Academy iherereye mu kahe karere?",
     kinyarwanda: "Rwanda Coding Academy iherereye he?",
   },
   {
@@ -582,7 +582,7 @@ export default function TranslationGame() {
           >
             <Card className="p-6 mb-8 border-2 border-green-400 dark:border-green-700 bg-white dark:bg-gray-800 shadow-md rounded-xl">
               <h2 className="text-xl text-center mb-2 text-green-700 dark:text-green-400 font-poppins">
-                Translate to Kinyarwanda
+                Answer in Kinyarwanda to gain points 🌟
               </h2>
               <p className="text-2xl md:text-3xl text-center font-bold text-green-800 dark:text-green-300 font-poppins">
                 "{currentQuestion.english}"
