@@ -12,6 +12,12 @@
 
 KinyaTutor is an interactive voice assistant that helps users learn and practice Kinyarwanda. It simulates how intelligent robots can communicate in local languages, empowering them to assist Rwandan communities.
 
+## 📱 Application Interface
+
+![KinyaTutor UI](./docs/images/kinyatutor-ui.png)
+
+*The KinyaTutor interface showing the voice recording feature and interactive question-answer system.*
+
 ## ✨ Features
 
 - **Speech Recognition (ASR)**: Transcribes Kinyarwanda speech to text using KinyaWhisper

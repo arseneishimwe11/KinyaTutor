@@ -8,15 +8,19 @@ from typing import List, Optional, Tuple
 import numpy as np
 import soundfile as sf
 import torch
+import tempfile
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, BaseSettings
+from pydantic import BaseModel
+from pydantic_settings import BaseSettings
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
-from TTS.api import TTS
+from gtts import gTTS
+from huggingface_hub import login
+
 
 # ================= Settings =================
 class Settings(BaseSettings):
@@ -124,6 +128,11 @@ qa_data = [
     )
 ]
 
+token = os.environ.get("HUGGINGFACE_TOKEN")
+if token:
+    login(token=token)
+
+
 try:
     nlp_model = SentenceTransformer(settings.nlp_model)
     all_questions = [
@@ -160,8 +169,13 @@ except Exception as e:
 
 # ================= TTS Setup =================
 try:
+
     logger.info("Initializing TTS...")
-    tts = TTS(model_name=settings.tts_model, progress_bar=False, gpu=False)
+    def text_to_speech(text, output_path, lang='en'):
+        """Generate speech using gTTS"""
+        tts = gTTS(text=text, lang=lang, slow=False)
+        tts.save(output_path)
+        return output_path
     if not settings.reference_audio.exists():
         raise FileNotFoundError(f"Reference audio {settings.reference_audio} not found")
 except Exception as e:
@@ -242,25 +256,23 @@ async def match_answer(question: str = Form(...)):
         logger.error(f"Matching error: {e}")
         raise HTTPException(500, "Ikosa mu gusubiza ikibazo")
 
-@app.post("/text-to-speech/", response_class=FileResponse)
-async def text_to_speech(text: str = Form(...)):
-    """Convert text to Kinyarwanda speech"""
+@app.post("/text-to-speech/")
+async def generate_speech(text: str = Form(...)):
+    """Generate speech from text"""
     try:
-        if len(text) > settings.max_text_length:
-            raise HTTPException(400, "Inyandiko ndende cyane (max 500 imibare)")
+        # Create output directory if it doesn't exist
+        os.makedirs("output", exist_ok=True)
         
-        output_path = settings.audio_output_dir / f"tts_{hash(text)}.wav"
-        tts.tts_to_file(
-            text=text,
-            file_path=str(output_path),
-            speaker_wav=str(settings.reference_audio),
-            language="rw"
-        )
-        return FileResponse(output_path, media_type="audio/wav")
+        # Generate a unique filename
+        output_file = f"output/speech_{hash(text) % 10000}.mp3"
         
+        # Generate speech
+        text_to_speech(text, output_file)
+        
+        # Return the audio file
+        return FileResponse(output_file, media_type="audio/mp3")
     except Exception as e:
-        logger.error(f"TTS error: {e}")
-        raise HTTPException(500, "Ikosa mu guhindura inyandiko kuri ijwi")
+        raise HTTPException(status_code=500, detail=f"Error generating speech: {str(e)}")
 
 @app.post("/process-audio/", response_model=dict)
 async def process_audio(file: UploadFile = File(...)):
