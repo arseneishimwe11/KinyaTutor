@@ -14,7 +14,7 @@ KinyaTutor is an interactive voice assistant that helps users learn and practice
 
 ## 📱 Application Interface
 
-![KinyaTutor UI](./docs/images/kinyatutor-ui.png)
+![KinyaTutor UI](./docs/images/kinyatutor-UI.png)
 
 *The KinyaTutor interface showing the voice recording feature and interactive question-answer system.*
 
