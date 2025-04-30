@@ -1,275 +1,304 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-from difflib import get_close_matches
 import os
-import tempfile
-import torch
-from transformers import pipeline
+import logging
+import unicodedata
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from typing import List, Optional, Tuple
+
+import numpy as np
 import soundfile as sf
+import torch
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, BaseSettings
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 from TTS.api import TTS
 
-app = FastAPI()
+# ================= Settings =================
+class Settings(BaseSettings):
+    asr_model: str = "benax-rw/KinyaWhisper"
+    tts_model: str = "tts_models/multilingual/multi-dataset/xtts_v2"
+    nlp_model: str = "distiluse-base-multilingual-cased-v2"
+    reference_audio: Path = Path("reference_audio.wav")
+    audio_output_dir: Path = Path("output")
+    min_confidence: float = 0.4
+    max_text_length: int = 500
+    device: str = "cpu"  # Force CPU usage
+    
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
 
-# Configure CORS
+settings = Settings()
+
+# ================= Initialization =================
+Path(settings.audio_output_dir).mkdir(exist_ok=True, parents=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger("KinyaTutor")
+
+app = FastAPI(
+    title="KinyaTutor API",
+    description="Kinyarwanda Voice Assistant for Intelligent Robotics",
+    version="2.1.0"
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize KinyaWhisper ASR model
+# ================= Data Models =================
+class QAPair(BaseModel):
+    question: str
+    answer: str
+    alternatives: List[str] = []
+
+class MatchResponse(BaseModel):
+    matched_question: Optional[str]
+    answer: str
+    confidence: float
+
+# ================= NLP Setup =================
+qa_data = [
+    QAPair(
+        question="Rwanda Coding Academy iherereye he?",
+        answer="Iherereye mu Karere ka Nyabihu, mu Ntara y'Iburengerazuba.",
+        alternatives=["Rwanda Coding Academy iri he?", "Location ya RCA?"]
+    ),
+    QAPair(
+        question="Umurwa mukuru w'u Rwanda ni uwuhe?",
+        answer="Ni Kigali.",
+        alternatives=["Ikipe y'igihugu y'u Rwanda iherereye he?"]
+    ),
+    QAPair(
+        question="Ikinyarwanda ni ururimi ruvugwa he?",
+        answer="Ikinyarwanda ni ururimi ruvugwa mu Rwanda no mu bihugu bikikije.",
+        alternatives=["Ikinyarwanda kivugwa he?", "Ni hehe bavuga Ikinyarwanda?"]
+    ),
+    QAPair(
+        question="U Rwanda rufite abaturage bangahe?",
+        answer="U Rwanda rufite abaturage barenga miliyoni 13 ukurikije ibarura rya 2022.",
+        alternatives=["Abaturage b'u Rwanda ni bangahe?", "Population y'u Rwanda?"]
+    ),
+    QAPair(
+        question="Ni ryari u Rwanda rwabonye ubwigenge?",
+        answer="U Rwanda rwabonye ubwigenge ku itariki ya 1 Nyakanga 1962.",
+        alternatives=["Independence y'u Rwanda yabaye ryari?", "U Rwanda rwigendeye ryari?"]
+    ),
+    QAPair(
+        question="Ni ibihe bihugu Rwanda ihana imbibi?",
+        answer="U Rwanda ruhana imbibi na Uganda mu majyaruguru, Tanzaniya mu burasirazuba, Burundi mu majyepfo, na Repubulika Iharanira Demokarasi ya Kongo mu burengerazuba.",
+        alternatives=["Ibihugu bihana imbibi n'u Rwanda ni ibihe?", "U Rwanda ruzengurutswe n'ibihe bihugu?"]
+    ),
+    QAPair(
+        question="Ni iyihe ndirimbo y'igihugu y'u Rwanda?",
+        answer="Indirimbo y'igihugu y'u Rwanda ni 'Rwanda Nziza'.",
+        alternatives=["National anthem y'u Rwanda ni iyihe?", "U Rwanda rufite ndirimbo y'igihugu yitwa iki?"]
+    ),
+    QAPair(
+        question="Ni iki kiranga ibendera ry'u Rwanda?",
+        answer="Ibendera ry'u Rwanda rigizwe n'amabara atatu: ubururu, umuhondo, n'icyatsi kibisi, hamwe n'izuba riri mu ruhande rw'iburyo.",
+        alternatives=["Flag y'u Rwanda igizwe n'iki?", "Ibendera ry'u Rwanda rifite amabara angahe?"]
+    ),
+    QAPair(
+        question="Amazi mu Kinyarwanda ni iki?",
+        answer="Amazi mu Kinyarwanda ni 'Amazi'.",
+        alternatives=["Water mu Kinyarwanda?", "Bavuga bate amazi mu Kinyarwanda?"]
+    ),
+    QAPair(
+        question="Muraho mu Cyongereza ni iki?",
+        answer="Muraho mu Cyongereza ni 'Hello' cyangwa 'Good morning'.",
+        alternatives=["Hello mu Kinyarwanda?", "Bavuga bate muraho mu Cyongereza?"]
+    )
+]
+
 try:
+    nlp_model = SentenceTransformer(settings.nlp_model)
+    all_questions = [
+        qa.question for qa in qa_data
+    ] + [
+        alt for qa in qa_data for alt in qa.alternatives
+    ]
+    question_embeddings = nlp_model.encode(all_questions, show_progress_bar=False)
+except Exception as e:
+    logger.error(f"NLP initialization failed: {e}")
+    nlp_model = None
+    question_embeddings = None
+
+# ================= ASR Setup =================
+try:
+    logger.info("Initializing ASR model...")
+    model = AutoModelForSpeechSeq2Seq.from_pretrained(
+        settings.asr_model,
+        torch_dtype=torch.float32,
+        low_cpu_mem_usage=True
+    )
+    processor = AutoProcessor.from_pretrained(settings.asr_model)
     asr_pipeline = pipeline(
         "automatic-speech-recognition",
-        model="benax-rw/KinyaWhisper",
-        device="cuda" if torch.cuda.is_available() else "cpu"
+        model=model,
+        tokenizer=processor.tokenizer,
+        feature_extractor=processor.feature_extractor,
+        device=settings.device,
+        generate_kwargs={"language": "rw"}  # Force Kinyarwanda
     )
-    print("KinyaWhisper ASR model loaded successfully")
 except Exception as e:
-    print(f"Error loading KinyaWhisper model: {str(e)}")
-    print("Falling back to default Whisper model")
-    asr_pipeline = pipeline(
-        "automatic-speech-recognition",
-        model="openai/whisper-small",
-        device="cuda" if torch.cuda.is_available() else "cpu"
-    )
+    logger.error(f"ASR initialization failed: {e}")
+    raise RuntimeError("ASR model loading failed")
 
-# Initialize TTS model
+# ================= TTS Setup =================
 try:
-    tts = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", progress_bar=False)
-    print("TTS model loaded successfully")
+    logger.info("Initializing TTS...")
+    tts = TTS(model_name=settings.tts_model, progress_bar=False, gpu=False)
+    if not settings.reference_audio.exists():
+        raise FileNotFoundError(f"Reference audio {settings.reference_audio} not found")
 except Exception as e:
-    print(f"Error loading TTS model: {str(e)}")
+    logger.error(f"TTS initialization failed: {e}")
+    raise RuntimeError("TTS initialization failed")
 
-# Create output directory for audio files
-os.makedirs("output", exist_ok=True)
+# ================= Core Logic =================
+def normalize_kinyarwanda(text: str) -> str:
+    """Normalize Kinyarwanda text for matching"""
+    text = unicodedata.normalize('NFKD', text.casefold())
+    return ''.join([c for c in text if not unicodedata.combining(c)]).translate(
+        str.maketrans("", "", ".,?!;:'\"()[]{}")
+    )
 
-# Expanded Question-Answer pairs in Kinyarwanda
-qa_pairs = {
-    # Original pairs
-    "rwanda coding academy iherereye he": "Iherereye mu Karere ka Nyabihu, mu Ntara y'Iburengerazuba.",
-    "umurwa mukuru w'u rwanda ni uwuhe": "Ni Kigali.",
-    "ikinyarwanda ni ururimi ruvugwa he": "Ikinyarwanda ni ururimi ruvugwa mu Rwanda no mu bihugu bikikije.",
-    "u rwanda rufite abaturage bangahe": "U Rwanda rufite abaturage barenga miliyoni 13 ukurikije ibarura rya 2022.",
-    "ni iki gisigaye kugira ngo umwaka urangire": "Hasigaye amezi make kugira ngo umwaka urangire.",
-    "ni ryari u rwanda rwabonye ubwigenge": "U Rwanda rwabonye ubwigenge ku itariki ya 1 Nyakanga 1962.",
-    "ni ikihe gihugu rwanda ihana imbibi": "U Rwanda ruhana imbibi na Uganda mu majyaruguru, Tanzaniya mu burasirazuba, Burundi mu majyepfo, na Repubulika Iharanira Demokarasi ya Kongo mu burengerazuba.",
-    "ni iyihe ndirimbo y'igihugu y'u rwanda": "Indirimbo y'igihugu y'u Rwanda ni 'Rwanda Nziza'.",
-    "ni iki kiranga ibendera ry'u rwanda": "Ibendera ry'u Rwanda rigizwe n'amabara atatu: ubururu, umuhondo, n'icyatsi kibisi, hamwe n'izuba riri mu ruhande rw'iburyo.",
+def find_best_match(query: str) -> Tuple[Optional[str], str, float]:
+    """Three-tier matching system for Kinyarwanda"""
+    normalized = normalize_kinyarwanda(query)
     
-    # Additional pairs
-    "muraho": "Mwaramutse neza! Mbwira icyo nakugezaho.",
-    "amakuru": "Amakuru ni meza, urakoze kubaza.",
-    "witwa nde": "Nitwa KinyaTutor, ndi umufasha wo kwiga Ikinyarwanda.",
-    "imodoka mu kinyarwanda": "Imodoka mu Kinyarwanda ni 'imodoka'.",
-    "amazi mu kinyarwanda": "Amazi mu Kinyarwanda ni 'amazi'.",
-    "umwaka mu kinyarwanda": "Umwaka mu Kinyarwanda ni 'umwaka'.",
-    "igitabo mu kinyarwanda": "Igitabo mu Kinyarwanda ni 'igitabo'.",
-    "umuntu mu kinyarwanda": "Umuntu mu Kinyarwanda ni 'umuntu'.",
-    "umwana mu kinyarwanda": "Umwana mu Kinyarwanda ni 'umwana'.",
-    "ishuri mu kinyarwanda": "Ishuri mu Kinyarwanda ni 'ishuri'.",
-    "umurima mu kinyarwanda": "Umurima mu Kinyarwanda ni 'umurima'.",
-    
-    # English questions with Kinyarwanda answers
-    "what is hello in kinyarwanda": "Hello mu Kinyarwanda ni 'Muraho' cyangwa 'Mwaramutse'.",
-    "how do you say water in kinyarwanda": "Water mu Kinyarwanda ni 'Amazi'.",
-    "how do you say car in kinyarwanda": "Car mu Kinyarwanda ni 'Imodoka'.",
-    "how do you say book in kinyarwanda": "Book mu Kinyarwanda ni 'Igitabo'.",
-    "how do you say person in kinyarwanda": "Person mu Kinyarwanda ni 'Umuntu'.",
-    "how do you say child in kinyarwanda": "Child mu Kinyarwanda ni 'Umwana'.",
-    "how do you say school in kinyarwanda": "School mu Kinyarwanda ni 'Ishuri'.",
-    "how do you say farm in kinyarwanda": "Farm mu Kinyarwanda ni 'Umurima'.",
-    
-    # Additional English questions
-    "where is rwanda coding academy located": "Rwanda Coding Academy iherereye mu Karere ka Nyabihu, mu Ntara y'Iburengerazuba.",
-    "what is the capital city of rwanda": "Umurwa mukuru w'u Rwanda ni Kigali.",
-    "where is kinyarwanda spoken": "Ikinyarwanda kivugwa mu Rwanda no mu bihugu bikikije.",
-    "how many people live in rwanda": "U Rwanda rufite abaturage barenga miliyoni 13 ukurikije ibarura rya 2022.",
-    "when did rwanda gain independence": "U Rwanda rwabonye ubwigenge ku itariki ya 1 Nyakanga 1962.",
-}
+    # 1. Exact match check
+    for qa in qa_data:
+        if normalized == normalize_kinyarwanda(qa.question):
+            return qa.question, qa.answer, 1.0
+        for alt in qa.alternatives:
+            if normalized == normalize_kinyarwanda(alt):
+                return qa.question, qa.answer, 0.95
 
-# English translations for better matching
-english_to_kinyarwanda = {
-    "where is rwanda coding academy located": "rwanda coding academy iherereye he",
-    "what is the capital city of rwanda": "umurwa mukuru w'u rwanda ni uwuhe",
-    "where is kinyarwanda spoken": "ikinyarwanda ni ururimi ruvugwa he",
-    "how many people live in rwanda": "u rwanda rufite abaturage bangahe",
-    "when did rwanda gain independence": "ni ryari u rwanda rwabonye ubwigenge",
-}
+    # 2. Semantic matching
+    if nlp_model and question_embeddings is not None:
+        query_embed = nlp_model.encode([normalized], show_progress_bar=False)
+        similarities = cosine_similarity(query_embed, question_embeddings)[0]
+        max_idx = np.argmax(similarities)
+        if similarities[max_idx] >= settings.min_confidence:
+            matched_question = all_questions[max_idx]
+            return matched_question, qa_data[max_idx % len(qa_data)].answer, float(similarities[max_idx])
 
-@app.get("/")
-async def root():
-    return {"message": "Welcome to KinyaTutor API. Use /docs for API documentation."}
+    # 3. Fuzzy fallback
+    normalized_questions = [normalize_kinyarwanda(q) for q in all_questions]
+    matches = get_close_matches(normalized, normalized_questions, n=1, cutoff=settings.min_confidence)
+    if matches:
+        idx = normalized_questions.index(matches[0])
+        return all_questions[idx], qa_data[idx % len(qa_data)].answer, 0.9
 
-@app.post("/transcribe/")
+    return None, "Mbabarira, sinzi igisubizo cy'icyo kibazo.", 0.0
+
+# ================= API Endpoints =================
+@app.post("/transcribe/", response_model=dict)
 async def transcribe_audio(file: UploadFile = File(...)):
-    """
-    Transcribe an audio file using KinyaWhisper ASR
-    """
+    """Convert Kinyarwanda speech to text"""
     try:
-        # Save uploaded file temporarily
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        temp_file.close()
+        if not file.content_type.startswith("audio/"):
+            raise HTTPException(400, "Ingingo ya dosiye ntabwo ari audio")
         
-        with open(temp_file.name, "wb") as f:
-            f.write(await file.read())
-        
-        # Transcribe using KinyaWhisper
-        result = asr_pipeline(temp_file.name)
-        transcription = result["text"]
-        
-        # Clean up
-        os.unlink(temp_file.name)
-        
-        return {"transcription": transcription}
+        with NamedTemporaryFile(suffix=".wav") as tmp:
+            tmp.write(await file.read())
+            audio, rate = sf.read(tmp.name)
+            
+            if audio.ndim > 1:
+                audio = np.mean(audio, axis=1)
+            
+            result = asr_pipeline({"raw": audio, "sampling_rate": rate})
+            return {"transcription": result["text"].strip()}
+            
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error transcribing audio: {str(e)}")
+        logger.error(f"Transcription error: {e}")
+        raise HTTPException(500, "Ikosa mu guhindura ijwi kuri inyandiko")
 
-@app.post("/match-answer/")
+@app.post("/match-answer/", response_model=MatchResponse)
 async def match_answer(question: str = Form(...)):
-    """
-    Match a transcribed question to the closest answer in our database
-    """
+    """Find best answer for a Kinyarwanda question"""
     try:
-        # Log the incoming question for debugging
-        print(f"Received question: {question}")
-        
-        # Normalize question (lowercase, remove punctuation)
-        normalized_question = question.lower().strip()
-        for char in ".,?!;:":
-            normalized_question = normalized_question.replace(char, "")
-        
-        print(f"Normalized question: {normalized_question}")
-        
-        # Try direct match first
-        if normalized_question in qa_pairs:
-            return {
-                "matched_question": normalized_question,
-                "answer": qa_pairs[normalized_question],
-                "confidence": 1.0
-            }
-        
-        # Check if it's an English question with a known translation
-        if normalized_question in english_to_kinyarwanda:
-            kinyarwanda_question = english_to_kinyarwanda[normalized_question]
-            return {
-                "matched_question": kinyarwanda_question,
-                "answer": qa_pairs[kinyarwanda_question],
-                "confidence": 0.9
-            }
-        
-        # Try fuzzy matching with a lower threshold
-        matches = get_close_matches(normalized_question, qa_pairs.keys(), n=1, cutoff=0.4)
-        
-        if matches:
-            matched_question = matches[0]
-            answer = qa_pairs[matched_question]
-            confidence = round(1 - (1 - 0.4) * (1 - len(matches[0])/max(len(normalized_question), 1)), 2)
-            
-            print(f"Matched question: {matched_question}, Answer: {answer}, Confidence: {confidence}")
-            
-            return {
-                "matched_question": matched_question,
-                "answer": answer,
-                "confidence": confidence
-            }
-        
-        # If no match found, check if it's an English question about Kinyarwanda
-        if any(word in normalized_question for word in ["kinyarwanda", "rwanda"]):
-            if any(word in normalized_question for word in ["how", "say", "translate", "what is"]):
-                return {
-                    "matched_question": None,
-                    "answer": "I'm not sure how to translate that specific word or phrase to Kinyarwanda. Try asking about common words like 'hello', 'water', or 'car'.",
-                    "confidence": 0.3
-                }
-        
-        # Default response when no match is found
-        return {
-            "matched_question": None,
-            "answer": "Mbabarira, sinzi igisubizo cy'icyo kibazo. (Sorry, I don't know the answer to that question.)",
-            "confidence": 0
-        }
+        matched_question, answer, confidence = find_best_match(question)
+        return MatchResponse(
+            matched_question=matched_question,
+            answer=answer,
+            confidence=confidence
+        )
     except Exception as e:
-        print(f"Error in match_answer: {str(e)}")
-        return {
-            "matched_question": None,
-            "answer": "Sorry, there was an error processing your question. Please try again.",
-            "confidence": 0
-        }
+        logger.error(f"Matching error: {e}")
+        raise HTTPException(500, "Ikosa mu gusubiza ikibazo")
 
-@app.post("/text-to-speech/")
+@app.post("/text-to-speech/", response_class=FileResponse)
 async def text_to_speech(text: str = Form(...)):
-    """
-    Convert text to speech using TTS
-    """
+    """Convert text to Kinyarwanda speech"""
     try:
-        # Create a unique filename
-        output_filename = f"output/speech_{hash(text) % 10000}.wav"
+        if len(text) > settings.max_text_length:
+            raise HTTPException(400, "Inyandiko ndende cyane (max 500 imibare)")
         
-        # Generate speech
+        output_path = settings.audio_output_dir / f"tts_{hash(text)}.wav"
         tts.tts_to_file(
             text=text,
-            file_path=output_filename,
-            speaker_wav="reference_audio.wav",  # Make sure this file exists
+            file_path=str(output_path),
+            speaker_wav=str(settings.reference_audio),
             language="rw"
         )
+        return FileResponse(output_path, media_type="audio/wav")
         
-        # Return the audio file
-        return FileResponse(output_filename, media_type="audio/wav")
     except Exception as e:
-        print(f"Error in text_to_speech: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error generating speech: {str(e)}")
+        logger.error(f"TTS error: {e}")
+        raise HTTPException(500, "Ikosa mu guhindura inyandiko kuri ijwi")
 
-@app.post("/process-audio/")
+@app.post("/process-audio/", response_model=dict)
 async def process_audio(file: UploadFile = File(...)):
-    """
-    Process an audio file: transcribe, match to an answer, and generate speech response
-    """
+    """Full audio processing pipeline"""
     try:
-        # Save uploaded file temporarily
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        temp_file.close()
+        # Transcribe
+        result = await transcribe_audio(file)
+        transcription = result["transcription"]
         
-        with open(temp_file.name, "wb") as f:
-            f.write(await file.read())
+        # Match answer
+        match_result = await match_answer(transcription)
         
-        # Transcribe using KinyaWhisper
-        result = asr_pipeline(temp_file.name)
-        transcription = result["text"]
-        
-        # Match to an answer
-        match_result = await match_answer(question=transcription)
-        answer = match_result["answer"]
-        
-        # Generate speech for the answer
-        output_filename = f"output/response_{hash(answer) % 10000}.wav"
-        
-        tts.tts_to_file(
-            text=answer,
-            file_path=output_filename,
-            speaker_wav="reference_audio.wav",  # Make sure this file exists
-            language="rw"
-        )
-        
-        # Clean up
-        os.unlink(temp_file.name)
+        # Generate speech
+        tts_response = await text_to_speech(match_result.answer)
         
         return {
             "transcription": transcription,
-            "answer": answer,
-            "audio_url": f"/audio/{os.path.basename(output_filename)}"
+            "answer": match_result.answer,
+            "audio_url": f"/audio/{Path(tts_response.path).name}",
+            "confidence": match_result.confidence
         }
+        
     except Exception as e:
-        print(f"Error in process_audio: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error processing audio: {str(e)}")
+        logger.error(f"Processing error: {e}")
+        raise HTTPException(500, "Ikosa mu gucunga audio")
 
-# Serve static files
-from fastapi.staticfiles import StaticFiles
-app.mount("/audio", StaticFiles(directory="output"), name="audio")
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "models": {
+            "asr": settings.asr_model,
+            "tts": settings.tts_model,
+            "nlp": settings.nlp_model
+        }
+    }
+
+app.mount("/audio", StaticFiles(directory=settings.audio_output_dir), name="audio")
 
 if __name__ == "__main__":
     import uvicorn

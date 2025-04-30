@@ -2,8 +2,7 @@ fastapi==0.103.1
 uvicorn==0.23.2
 python-multipart==0.0.6
 transformers==4.33.2
-torch==2.0.1
-numpy==1.25.2
-soundfile==0.12.1
-TTS==0.21.1
-difflib==3.10.0
+torch
+numpy
+soundfile
+gTTS
